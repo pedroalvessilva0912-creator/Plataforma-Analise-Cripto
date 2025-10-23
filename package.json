@@ -1,5 +1,5 @@
 {
-  "name": "copy-of-crypto-analysis-platform",
+  "name": "criptoinvest-pro",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "react": "^19.2.0",
+    "recharts": "^3.3.0",
+    "@google/genai": "^1.26.0",
     "react-dom": "^19.2.0"
   },
   "devDependencies": {

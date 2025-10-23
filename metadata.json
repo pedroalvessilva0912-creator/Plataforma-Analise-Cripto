@@ -1,5 +1,5 @@
 {
-  "name": "Copy of Crypto-Analysis-Platform",
-  "description": "Plataforma para análise técnica de criptomoedas com Python e IA.",
+  "name": "CriptoInvest Pro",
+  "description": "Uma aplicação web para investidores de criptomoedas, combinando dados de mercado e gráficos interativos com uma análise de risco e retorno potencial alimentada por IA.",
   "requestFramePermissions": []
 }

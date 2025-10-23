@@ -1,525 +1,363 @@
-
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { createRoot } from 'react-dom/client';
+import React, { useState, useEffect } from 'react';
+import ReactDOM from 'react-dom/client';
+import { GoogleGenAI, Type } from "@google/genai";
+import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
 
 // --- TYPES --- //
-interface Crypto {
-  id: string;
-  name: string;
-  symbol: string;
-  image: string;
-}
-
-interface CryptoStats {
-  id: string;
-  name: string;
-  // FIX: Added 'symbol' property to the CryptoStats interface to resolve a type error on line 180. The API response contains this field.
-  symbol: string;
-  image: string;
-  current_price: number;
-  market_cap: number;
-  total_volume: number;
-  price_change_percentage_24h: number;
-}
-
 interface HistoricalData {
-  prices: [number, number][];
-  total_volumes: [number, number][];
+  date: string;
+  price: number;
 }
 
-// --- API HELPER --- //
-const API_BASE_URL = 'https://api.coingecko.com/api/v3';
-
-async function apiFetch<T>(endpoint: string): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}/${endpoint}`);
-  if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(errorData.error || `API request failed with status ${response.status}`);
-  }
-  return response.json() as Promise<T>;
+interface CryptoData {
+  id: string;
+  name: string;
+  symbol: string;
+  price: number;
+  change24h: number;
+  marketCap: string;
+  volume24h: string;
+  color: string;
+  history: HistoricalData[];
 }
 
-// --- UTILITY FUNCTIONS --- //
-const formatCurrency = (value: number) =>
-  new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: value < 1 ? 8 : 2,
-  }).format(value);
+interface RiskReturnAnalysis {
+  nivelDeRisco: string;
+  potencialDeRetorno: string;
+  analise: string;
+}
 
-const formatLargeNumber = (value: number) =>
-  new Intl.NumberFormat('en-US', {
-    notation: 'compact',
-    maximumFractionDigits: 2,
-  }).format(value);
-  
-// --- CALCULATION HOOKS --- //
-const useTechnicalAnalysis = (prices: [number, number][]) => {
-  return useMemo(() => {
-    if (!prices || prices.length === 0) {
-      return { sma20: [], sma50: [], rsi: [], support: null, resistance: null };
-    }
 
-    // SMA
-    const calculateSMA = (data: number[], period: number) => {
-      const sma = [];
-      for (let i = period - 1; i < data.length; i++) {
-        const sum = data.slice(i - period + 1, i + 1).reduce((acc, val) => acc + val, 0);
-        sma.push({ x: prices[i][0], y: sum / period });
-      }
-      return sma;
-    };
-    
-    const closingPrices = prices.map(p => p[1]);
-    const sma20 = calculateSMA(closingPrices, 20);
-    const sma50 = calculateSMA(closingPrices, 50);
+// --- GEMINI SERVICE --- //
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-    // RSI
-    const calculateRSI = (data: number[], period = 14) => {
-      const rsi: {x: number, y: number}[] = [];
-      let gains = 0;
-      let losses = 0;
-
-      for (let i = 1; i < data.length; i++) {
-        const change = data[i] - data[i - 1];
-        if (change > 0) {
-          gains += change;
-        } else {
-          losses -= change;
-        }
-        
-        if (i >= period) {
-          const avgGain = gains / period;
-          const avgLoss = losses / period;
-          const rs = avgGain / (avgLoss || 1); // Avoid division by zero
-          const rsiValue = 100 - (100 / (1 + rs));
-          rsi.push({ x: prices[i][0], y: rsiValue });
-
-          const prevChange = data[i - period + 1] - data[i - period];
-           if (prevChange > 0) {
-              gains -= prevChange;
-           } else {
-              losses += prevChange;
-           }
-        }
-      }
-      return rsi;
-    };
-    const rsi = calculateRSI(closingPrices);
-    
-    // Support and Resistance
-    const recentPrices = closingPrices.slice(-90); // Look at last 90 days
-    const support = Math.min(...recentPrices);
-    const resistance = Math.max(...recentPrices);
-
-    return { sma20, sma50, rsi, support, resistance };
-  }, [prices]);
+const analysisSchema = {
+    type: Type.OBJECT,
+    properties: {
+      nivelDeRisco: {
+        type: Type.STRING,
+        description: "O nível de risco do investimento, categorizado como 'Baixo', 'Médio' ou 'Alto'.",
+      },
+      potencialDeRetorno: {
+        type: Type.STRING,
+        description: "O potencial de retorno do investimento, categorizado como 'Baixo', 'Médio' ou 'Alto'.",
+      },
+      analise: {
+        type: Type.STRING,
+        description: "Uma análise detalhada em 3-4 frases sobre os fatores de risco e retorno, justificando as classificações.",
+      },
+    },
+    required: ["nivelDeRisco", "potencialDeRetorno", "analise"],
 };
 
-const useRiskReturnAnalysis = (marketData: CryptoStats[], days: number) => {
-    return useMemo(() => {
-        if (!marketData || marketData.length === 0) return [];
-        return marketData.map(coin => {
-            const priceChangeKey = `price_change_percentage_${days}d_in_currency` as keyof typeof coin;
-            const dailyReturn = (coin as any)[`price_change_percentage_24h_in_currency`] / 100 || 0;
-            // Simplified volatility from 24h change - a real app would use historical data std dev
-            const volatility = Math.abs(dailyReturn) * Math.sqrt(365); 
-            const annualReturn = (1 + dailyReturn)**365 - 1;
+const analyzeCryptoRiskReturn = async (crypto: CryptoData): Promise<RiskReturnAnalysis> => {
+  try {
+    const prompt = `Como um analista de investimentos experiente, analise o risco e o retorno para a criptomoeda ${crypto.name} (${crypto.symbol}). O preço atual é aproximadamente $${crypto.price.toFixed(2)} e a capitalização de mercado é de ${crypto.marketCap}. Considere a volatilidade histórica (simulada), o volume de negociação e o sentimento geral do mercado de criptoativos. Forneça uma análise concisa, profissional e direta para um investidor, usando o schema JSON fornecido.`;
+    
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: analysisSchema,
+      },
+    });
 
-            return {
-                x: volatility, // Risk
-                y: annualReturn, // Return
-                name: coin.name,
-                image: coin.image
-            };
+    const jsonText = response.text.trim();
+    const analysisData = JSON.parse(jsonText);
+    
+    return analysisData;
+
+  } catch (error) {
+    console.error("Erro ao buscar análise do Gemini API:", error);
+    throw new Error("Não foi possível se comunicar com o serviço de IA.");
+  }
+};
+
+
+// --- DATA HOOK --- //
+const useCryptoData = () => {
+  const [cryptos, setCryptos] = useState<CryptoData[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const COIN_COLORS: { [key: string]: string } = {
+      bitcoin: '#f7931a',
+      ethereum: '#627eea',
+      solana: '#9945FF',
+      cardano: '#0033ad',
+      ripple: '#00aae4',
+      dogecoin: '#c2a633',
+    };
+
+    const generateMockHistory = (basePrice: number, days = 30): HistoricalData[] => {
+      const history: HistoricalData[] = [];
+      let price = basePrice;
+      const today = new Date();
+
+      for (let i = 0; i < days; i++) {
+        const date = new Date(today);
+        date.setDate(today.getDate() - (days - 1 - i));
+        const volatility = (Math.random() - 0.45) * 0.1; // Simula a volatilidade diária
+        price *= (1 + volatility);
+        history.push({
+          date: date.toLocaleDateString('pt-BR', { month: 'short', day: 'numeric' }),
+          price: parseFloat(price.toFixed(2)),
         });
-    }, [marketData, days]);
+      }
+      return history;
+    };
+
+    const MOCK_DATA: CryptoData[] = [
+      { id: 'bitcoin', name: 'Bitcoin', symbol: 'BTC', price: 67500.82, change24h: 1.5, marketCap: '1.3T', volume24h: '25.5B', color: COIN_COLORS.bitcoin, history: generateMockHistory(65000) },
+      { id: 'ethereum', name: 'Ethereum', symbol: 'ETH', price: 3500.45, change24h: -0.8, marketCap: '420B', volume24h: '15.2B', color: COIN_COLORS.ethereum, history: generateMockHistory(3600) },
+      { id: 'solana', name: 'Solana', symbol: 'SOL', price: 150.1, change24h: 3.2, marketCap: '69B', volume24h: '3.1B', color: COIN_COLORS.solana, history: generateMockHistory(140) },
+      { id: 'cardano', name: 'Cardano', symbol: 'ADA', price: 0.45, change24h: -2.1, marketCap: '16B', volume24h: '500M', color: COIN_COLORS.cardano, history: generateMockHistory(0.48) },
+      { id: 'ripple', name: 'Ripple', symbol: 'XRP', price: 0.52, change24h: 0.5, marketCap: '28B', volume24h: '1.2B', color: COIN_COLORS.ripple, history: generateMockHistory(0.51) },
+      { id: 'dogecoin', name: 'Dogecoin', symbol: 'DOGE', price: 0.15, change24h: 5.8, marketCap: '21B', volume24h: '900M', color: COIN_COLORS.dogecoin, history: generateMockHistory(0.13) },
+    ];
+
+    const loadMockData = () => {
+      setLoading(true);
+      setError(null);
+      setTimeout(() => {
+        try {
+          setCryptos(MOCK_DATA);
+        } catch (err) {
+            setError('Falha ao carregar os dados simulados.');
+            console.error(err);
+        } finally {
+          setLoading(false);
+        }
+      }, 500);
+    };
+
+    loadMockData();
+  }, []);
+
+  return { cryptos, loading, error };
 };
 
 
 // --- UI COMPONENTS --- //
-const Loader = () => <div className="loader"><div className="spinner"></div></div>;
-const ErrorMessage = ({ message }: { message: string }) => <div className="error-message">Error: {message}</div>;
-
-const Header = ({ onThemeChange, theme }: { onThemeChange: () => void, theme: string }) => (
-  <header className="app-header">
-    <h1><span role="img" aria-label="chart icon">📈</span> Crypto Analysis Dashboard</h1>
-    <button onClick={onThemeChange} className="theme-switcher" aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}>
-      {theme === 'light' ? '🌙' : '☀️'}
-    </button>
-  </header>
-);
-
-const Controls = ({ cryptoList, selectedCrypto, onCryptoChange, period, onPeriodChange, onAddToFavorites, isFavorite }: any) => (
-  <div className="header-controls">
-    <select className="select-input" value={selectedCrypto} onChange={e => onCryptoChange(e.target.value)} aria-label="Select Cryptocurrency">
-      {cryptoList.map((crypto: Crypto) => (
-        <option key={crypto.id} value={crypto.id}>{crypto.name}</option>
-      ))}
-    </select>
-    <select className="select-input" value={period} onChange={e => onPeriodChange(e.target.value)} aria-label="Select Time Period">
-      <option value="1">1D</option>
-      <option value="7">7D</option>
-      <option value="30">30D</option>
-      <option value="90">90D</option>
-      <option value="365">1Y</option>
-      <option value="max">Max</option>
-    </select>
-    <button className="button" onClick={onAddToFavorites}>
-      {isFavorite ? '★ Unfavorite' : '☆ Add to Favorites'}
-    </button>
-  </div>
-);
-
-const CurrentPrice = ({ stats }: { stats: CryptoStats | null }) => {
-    if (!stats) return null;
-    const change = stats.price_change_percentage_24h;
-    const changeClass = change >= 0 ? 'positive' : 'negative';
-
+const LoadingSpinner: React.FC<{ size?: 'sm' | 'md' | 'lg' }> = ({ size = 'md' }) => {
+    const sizeClasses = { sm: 'w-5 h-5', md: 'w-8 h-8', lg: 'w-12 h-12' };
     return (
-        <div className="card current-price-card">
-            <div className="price-info">
-                <h2>{stats.name} ({stats.symbol.toUpperCase()})</h2>
-                <span className="price">{formatCurrency(stats.current_price)}</span>
-                <span className={`price-change ${changeClass}`}>
-                    {change >= 0 ? '▲' : '▼'} {change.toFixed(2)}% (24h)
-                </span>
-            </div>
-            <div className="market-stats">
-                <div className="stat">
-                    <div className="stat-label">Market Cap</div>
-                    <div className="stat-value">{formatLargeNumber(stats.market_cap)}</div>
-                </div>
-                <div className="stat">
-                    <div className="stat-label">Volume (24h)</div>
-                    <div className="stat-value">{formatLargeNumber(stats.total_volume)}</div>
-                </div>
-            </div>
-        </div>
+        <svg className={`animate-spin text-cyan-400 ${sizeClasses[size]}`} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
     );
 };
 
-const ChartComponent = ({ data, techAnalysis }: { data: HistoricalData, techAnalysis: any }) => {
-    const chartRef = useRef<HTMLCanvasElement>(null);
-    const chartInstance = useRef<any>(null);
-
-    useEffect(() => {
-        if (!chartRef.current || !data) return;
-
-        if (chartInstance.current) {
-            chartInstance.current.destroy();
-        }
-
-        const ctx = chartRef.current.getContext('2d');
-        if (!ctx) return;
-
-        const { support, resistance } = techAnalysis;
-
-        chartInstance.current = new (window as any).Chart(ctx, {
-            type: 'line',
-            data: {
-                datasets: [
-                    {
-                        label: 'Price',
-                        data: data.prices.map(([time, price]) => ({ x: time, y: price })),
-                        borderColor: 'rgb(0, 123, 255)',
-                        tension: 0.1,
-                        pointRadius: 0,
-                        yAxisID: 'y',
-                    },
-                    {
-                        label: 'SMA 20',
-                        data: techAnalysis.sma20,
-                        borderColor: 'rgb(255, 159, 64)',
-                        borderDash: [5, 5],
-                        pointRadius: 0,
-                        yAxisID: 'y',
-                    },
-                    {
-                        label: 'SMA 50',
-                        data: techAnalysis.sma50,
-                        borderColor: 'rgb(231, 99, 255)',
-                        borderDash: [5, 5],
-                        pointRadius: 0,
-                        yAxisID: 'y',
-                    },
-                    {
-                        label: 'RSI',
-                        data: techAnalysis.rsi,
-                        borderColor: 'rgb(75, 192, 192, 0.5)',
-                        pointRadius: 0,
-                        yAxisID: 'y1',
-                    },
-                    {
-                        label: 'Volume',
-                        data: data.total_volumes.map(([time, vol]) => ({ x: time, y: vol })),
-                        backgroundColor: 'rgba(150, 150, 150, 0.2)',
-                        type: 'bar',
-                        yAxisID: 'y2',
-                    }
-                ]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {
-                    x: {
-                        type: 'time',
-                        time: { unit: 'day' },
-                        grid: { color: 'rgba(255, 255, 255, 0.1)' }
-                    },
-                    y: {
-                        type: 'linear',
-                        display: true,
-                        position: 'left',
-                        title: { display: true, text: 'Price (USD)' },
-                        grid: { color: 'rgba(255, 255, 255, 0.1)' }
-                    },
-                    y1: {
-                        type: 'linear',
-                        display: true,
-                        position: 'right',
-                        min: 0, max: 100,
-                        title: { display: true, text: 'RSI' },
-                        grid: { drawOnChartArea: false },
-                    },
-                    y2: {
-                        type: 'linear',
-                        display: false, // hide volume axis
-                    }
-                },
-                plugins: {
-                    tooltip: { mode: 'index', intersect: false },
-                    annotation: {
-                        annotations: {
-                           ...(support && {
-                             line1: {
-                               type: 'line',
-                               yMin: support,
-                               yMax: support,
-                               borderColor: 'rgb(40, 167, 69, 0.7)',
-                               borderWidth: 2,
-                               label: { content: `Support: ${formatCurrency(support)}`, enabled: true, position: 'start' }
-                            }
-                           }),
-                           ...(resistance && {
-                            line2: {
-                               type: 'line',
-                               yMin: resistance,
-                               yMax: resistance,
-                               borderColor: 'rgb(220, 53, 69, 0.7)',
-                               borderWidth: 2,
-                               label: { content: `Resistance: ${formatCurrency(resistance)}`, enabled: true, position: 'start' }
-                            }
-                           })
-                        }
-                    }
-                }
-            }
-        });
-
-        return () => {
-            if (chartInstance.current) {
-                chartInstance.current.destroy();
-            }
-        };
-    }, [data, techAnalysis]);
-
-    return <div className="chart-wrapper"><canvas ref={chartRef}></canvas></div>;
-};
-
-const RiskReturnChart = ({ data }: { data: any[] }) => {
-    const chartRef = useRef<HTMLCanvasElement>(null);
-    const chartInstance = useRef<any>(null);
-
-    useEffect(() => {
-        if (!chartRef.current || !data) return;
-        if (chartInstance.current) chartInstance.current.destroy();
-
-        const ctx = chartRef.current.getContext('2d');
-        if (!ctx) return;
-        
-        chartInstance.current = new (window as any).Chart(ctx, {
-            type: 'scatter',
-            data: {
-                datasets: [{
-                    label: 'Crypto Assets',
-                    data: data,
-                    backgroundColor: 'rgba(0, 123, 255, 0.6)',
-                    pointRadius: 8,
-                    pointHoverRadius: 12
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {
-                    x: {
-                        title: { display: true, text: 'Risk (Annualized Volatility)' },
-                        ticks: { callback: (value) => `${(Number(value) * 100).toFixed(0)}%` }
-                    },
-                    y: {
-                        title: { display: true, text: 'Return (Annualized)' },
-                        ticks: { callback: (value) => `${(Number(value) * 100).toFixed(0)}%` }
-                    }
-                },
-                plugins: {
-                    tooltip: {
-                        callbacks: {
-                            label: (context) => {
-                                const point = context.raw as any;
-                                return `${point.name}: Risk ${(point.x * 100).toFixed(2)}%, Return ${(point.y * 100).toFixed(2)}%`;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-    }, [data]);
-    
-    return <div className="chart-wrapper" style={{height: '400px'}}><canvas ref={chartRef}></canvas></div>;
-};
-
-const FavoritesList = ({ favorites, onSelect, onRemove }: { favorites: Crypto[], onSelect: (id: string) => void, onRemove: (id: string) => void }) => (
-    <div className="card">
-        <h3 className="card-title">Favorites</h3>
-        {favorites.length > 0 ? (
-            <ul className="favorites-list">
-                {favorites.map(fav => (
-                    <li key={fav.id} className="favorite-item">
-                        <div className="favorite-item-info" onClick={() => onSelect(fav.id)}>
-                            <img src={fav.image} alt={fav.name} />
-                            <span className="favorite-item-name">{fav.name}</span>
-                        </div>
-                        <button className="remove-favorite-btn" onClick={(e) => { e.stopPropagation(); onRemove(fav.id); }} aria-label={`Remove ${fav.name} from favorites`}>
-                            &times;
-                        </button>
-                    </li>
-                ))}
-            </ul>
-        ) : (
-            <p>No favorites added yet.</p>
-        )}
-    </div>
+const Header: React.FC = () => (
+    <header className="bg-slate-900/50 backdrop-blur-sm border-b border-slate-700 sticky top-0 z-10">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex items-center justify-between h-16">
+          <div className="flex items-center">
+            <svg className="w-8 h-8 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+            </svg>
+            <h1 className="text-2xl font-bold text-white ml-2">CriptoInvest Pro</h1>
+          </div>
+        </div>
+      </div>
+    </header>
 );
 
-
-// --- MAIN APP COMPONENT --- //
-const App = () => {
-  const [theme, setTheme] = useState('dark');
-  const [cryptoList, setCryptoList] = useState<Crypto[]>([]);
-  const [marketData, setMarketData] = useState<CryptoStats[]>([]);
-  const [selectedCrypto, setSelectedCrypto] = useState('bitcoin');
-  const [period, setPeriod] = useState('365');
-  const [historicalData, setHistoricalData] = useState<HistoricalData | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [favorites, setFavorites] = useState<string[]>([]);
-  
-  useEffect(() => {
-    document.body.setAttribute('data-theme', theme);
-  }, [theme]);
-
-  useEffect(() => {
-    const savedFavorites = JSON.parse(localStorage.getItem('cryptoFavorites') || '[]');
-    setFavorites(savedFavorites);
-
-    const fetchInitialData = async () => {
-      try {
-        setLoading(true);
-        setError(null);
-        const [coins, market] = await Promise.all([
-          apiFetch<Crypto[]>('coins/list?include_platform=false'),
-          apiFetch<CryptoStats[]>('coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false&locale=en')
-        ]);
-        setCryptoList(coins);
-        setMarketData(market);
-      } catch (err: any) {
-        setError(err.message);
-      }
-    };
-    fetchInitialData();
-  }, []);
-  
-  useEffect(() => {
-    if (!selectedCrypto) return;
-    const fetchChartData = async () => {
-      try {
-        setLoading(true);
-        setError(null);
-        const data = await apiFetch<HistoricalData>(`coins/${selectedCrypto}/market_chart?vs_currency=usd&days=${period}`);
-        setHistoricalData(data);
-      } catch (err: any) {
-        setError(err.message);
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchChartData();
-  }, [selectedCrypto, period]);
-
-  const handleToggleFavorite = () => {
-      const newFavorites = favorites.includes(selectedCrypto)
-          ? favorites.filter(id => id !== selectedCrypto)
-          : [...favorites, selectedCrypto];
-      setFavorites(newFavorites);
-      localStorage.setItem('cryptoFavorites', JSON.stringify(newFavorites));
+const CryptoChart: React.FC<{ data: HistoricalData[], color: string }> = ({ data, color }) => {
+  const CustomTooltip = ({ active, payload, label }: any) => {
+    if (active && payload && payload.length) {
+      return (
+        <div className="bg-slate-700 p-2 border border-slate-600 rounded-md shadow-lg">
+          <p className="label text-white">{`${label}`}</p>
+          <p className="intro" style={{ color }}>{`Preço: $${payload[0].value.toFixed(2)}`}</p>
+        </div>
+      );
+    }
+    return null;
   };
-  
-  const favoriteDetails = useMemo(() => {
-      return favorites.map(id => cryptoList.find(c => c.id === id)).filter(Boolean) as Crypto[];
-  }, [favorites, cryptoList]);
-  
-  const techAnalysis = useTechnicalAnalysis(historicalData?.prices || []);
-  const riskReturnData = useRiskReturnAnalysis(marketData, 30);
-  const currentStats = marketData.find(c => c.id === selectedCrypto);
+    
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={data} margin={{ top: 5, right: 20, left: -10, bottom: 5 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+        <XAxis dataKey="date" stroke="#94a3b8" tick={{ fontSize: 12 }} />
+        <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} domain={['dataMin', 'dataMax']} tickFormatter={(value) => `$${Number(value).toFixed(0)}`} />
+        <Tooltip content={<CustomTooltip />} />
+        <Line type="monotone" dataKey="price" stroke={color} strokeWidth={2} dot={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+};
+
+const CryptoCard: React.FC<{ crypto: CryptoData, isSelected: boolean, onSelect: () => void }> = ({ crypto, isSelected, onSelect }) => {
+  const isPositive = crypto.change24h >= 0;
+  const changeColor = isPositive ? 'text-green-500' : 'text-red-500';
+  const sparklineColor = isPositive ? '#22c55e' : '#ef4444';
+  const selectedClasses = isSelected ? 'ring-2 ring-cyan-400 scale-105 shadow-cyan-500/30' : 'ring-1 ring-slate-700 hover:ring-cyan-500';
 
   return (
-    <div className="app-container">
-      <Header onThemeChange={() => setTheme(theme === 'light' ? 'dark' : 'light')} theme={theme} />
-      <Controls 
-        cryptoList={cryptoList}
-        selectedCrypto={selectedCrypto}
-        onCryptoChange={setSelectedCrypto}
-        period={period}
-        onPeriodChange={setPeriod}
-        onAddToFavorites={handleToggleFavorite}
-        isFavorite={favorites.includes(selectedCrypto)}
-      />
-
-      <main className="dashboard-grid" style={{marginTop: '1.5rem'}}>
-        <CurrentPrice stats={currentStats || null} />
-        <div className="card main-chart-container">
-          <div className="card-header"><h3 className="card-title">Price Chart & Indicators</h3></div>
-          {loading ? <Loader /> : error ? <ErrorMessage message={error} /> : historicalData && <ChartComponent data={historicalData} techAnalysis={techAnalysis} />}
+    <div onClick={onSelect} className={`bg-slate-800 p-4 rounded-lg cursor-pointer transition-all duration-300 shadow-lg hover:shadow-xl flex flex-col justify-between ${selectedClasses}`}>
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-lg font-bold text-white">{crypto.name}</p>
+          <p className="text-sm text-gray-400">{crypto.symbol}</p>
         </div>
-        
-        <div className="card">
-             <div className="card-header"><h3 className="card-title">Risk-Return Analysis (Top 100)</h3></div>
-             {marketData.length > 0 ? <RiskReturnChart data={riskReturnData} /> : <Loader />}
-        </div>
-        
-        <FavoritesList 
-            favorites={favoriteDetails} 
-            onSelect={setSelectedCrypto} 
-            onRemove={(idToRemove) => {
-                const newFavorites = favorites.filter(id => id !== idToRemove);
-                setFavorites(newFavorites);
-                localStorage.setItem('cryptoFavorites', JSON.stringify(newFavorites));
-            }}
-        />
-        
-        <div className="card">
-            <h3 className="card-title">News & Insights</h3>
-            <p>A integração de notícias em tempo real está em desenvolvimento. Volte em breve para atualizações de mercado e análises de sentimento.</p>
-        </div>
-      </main>
+        <div className="w-10 h-10 rounded-full flex items-center justify-center bg-slate-700 font-bold text-white">{crypto.symbol}</div>
+      </div>
+      <div className="h-12 w-full my-2">
+        <ResponsiveContainer width="100%" height="100%"><LineChart data={crypto.history}><Line type="monotone" dataKey="price" stroke={sparklineColor} strokeWidth={2} dot={false} /></LineChart></ResponsiveContainer>
+      </div>
+      <div className="text-right">
+        <p className="text-xl font-semibold text-white">${crypto.price.toLocaleString('en-US')}</p>
+        <p className={`text-md font-medium ${changeColor}`}>{isPositive ? '+' : ''}{crypto.change24h.toFixed(2)}%</p>
+      </div>
     </div>
   );
 };
 
-const container = document.getElementById('root');
-const root = createRoot(container!);
-root.render(<App />);
+const Dashboard: React.FC<{ cryptos: CryptoData[], selectedCrypto: CryptoData | null, onCryptoSelect: (crypto: CryptoData) => void }> = ({ cryptos, selectedCrypto, onCryptoSelect }) => (
+    <div className="space-y-8">
+      {selectedCrypto && (
+        <div className="bg-slate-800 p-4 sm:p-6 rounded-lg shadow-lg">
+          <h2 className="text-2xl sm:text-3xl font-bold text-white mb-2">{selectedCrypto.name} ({selectedCrypto.symbol})</h2>
+          <p className="text-3xl sm:text-4xl font-semibold text-white">${selectedCrypto.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+          <div className="h-80 sm:h-96 w-full mt-4"><CryptoChart data={selectedCrypto.history} color={selectedCrypto.color} /></div>
+        </div>
+      )}
+      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+        {cryptos.map((crypto) => (
+          <CryptoCard key={crypto.id} crypto={crypto} isSelected={selectedCrypto?.id === crypto.id} onSelect={() => onCryptoSelect(crypto)} />
+        ))}
+      </div>
+    </div>
+);
+
+const RiskReturnAnalyzer: React.FC<{ selectedCrypto: CryptoData | null }> = ({ selectedCrypto }) => {
+  const [analysis, setAnalysis] = useState<RiskReturnAnalysis | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setAnalysis(null);
+    setError(null);
+  }, [selectedCrypto]);
+
+  const handleAnalyze = async () => {
+    if (!selectedCrypto) return;
+    setLoading(true);
+    setError(null);
+    setAnalysis(null);
+    try {
+      const result = await analyzeCryptoRiskReturn(selectedCrypto);
+      setAnalysis(result);
+    } catch (err) {
+      setError('Falha ao gerar análise. Tente novamente.');
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+  
+  const getRiskColor = (level: string = '') => {
+    switch (level.toLowerCase()) {
+      case 'alto': return 'text-red-400';
+      case 'médio': return 'text-yellow-400';
+      case 'baixo': return 'text-green-400';
+      default: return 'text-gray-400';
+    }
+  };
+
+  const getReturnColor = (level: string = '') => {
+    switch (level.toLowerCase()) {
+      case 'alto': return 'text-green-400';
+      case 'médio': return 'text-yellow-400';
+      case 'baixo': return 'text-red-400';
+      default: return 'text-gray-400';
+    }
+  };
+
+  return (
+    <div className="bg-slate-800 p-4 sm:p-6 rounded-lg shadow-lg h-full">
+      <h2 className="text-2xl font-bold text-white mb-4">Análise com IA</h2>
+      {!selectedCrypto ? (
+        <div className="text-center text-gray-400 py-10"><p>Selecione uma criptomoeda no painel para analisar.</p></div>
+      ) : (
+        <>
+          <p className="text-gray-400 mb-4">Analisando: <span className="font-bold text-cyan-400">{selectedCrypto.name}</span></p>
+          <button onClick={handleAnalyze} disabled={loading} className="w-full bg-cyan-500 text-white font-bold py-2 px-4 rounded-lg hover:bg-cyan-600 disabled:bg-slate-600 transition-colors duration-300 flex items-center justify-center">
+            {loading ? <LoadingSpinner size="sm" /> : 'Analisar Risco e Retorno'}
+          </button>
+          {error && <p className="text-red-500 mt-4 text-center">{error}</p>}
+          <div className="mt-6 space-y-4">
+            {!analysis && !loading && <div className="text-center text-gray-400 py-10"><p>Clique no botão para gerar uma análise de risco e potencial de retorno para {selectedCrypto.name} usando a IA do Gemini.</p></div>}
+            {analysis && (
+              <div className="bg-slate-700/50 p-4 rounded-md space-y-4 animate-fade-in">
+                <div><h3 className="font-semibold text-gray-300 text-sm">Nível de Risco</h3><p className={`text-lg font-bold ${getRiskColor(analysis.nivelDeRisco)}`}>{analysis.nivelDeRisco || 'N/A'}</p></div>
+                <div><h3 className="font-semibold text-gray-300 text-sm">Potencial de Retorno</h3><p className={`text-lg font-bold ${getReturnColor(analysis.potencialDeRetorno)}`}>{analysis.potencialDeRetorno || 'N/A'}</p></div>
+                <div><h3 className="font-semibold text-gray-300 text-sm">Análise Resumida</h3><p className="text-gray-300 mt-1 text-sm">{analysis.analise}</p></div>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+
+// --- MAIN APPLICATION --- //
+function App() {
+  const { cryptos, loading, error } = useCryptoData();
+  const [selectedCrypto, setSelectedCrypto] = useState<CryptoData | null>(null);
+
+  useEffect(() => {
+    if (cryptos.length > 0 && !selectedCrypto) {
+      setSelectedCrypto(cryptos[0]);
+    }
+  }, [cryptos, selectedCrypto]);
+
+  return (
+    <div className="min-h-screen bg-slate-900 font-sans">
+      <Header />
+      <main className="p-4 sm:p-6 lg:p-8 max-w-7xl mx-auto">
+        {loading && (
+          <div className="flex justify-center items-center" style={{ height: 'calc(100vh - 100px)' }}>
+            <LoadingSpinner size="lg" />
+          </div>
+        )}
+        {error && (
+            <div className="text-red-500 text-center mt-10 p-4 bg-slate-800 rounded-lg">
+                <p className="font-bold text-lg">Ocorreu um erro</p>
+                <p>{error}</p>
+            </div>
+        )}
+        {!loading && !error && cryptos.length > 0 && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div className="lg:col-span-2">
+              <Dashboard cryptos={cryptos} selectedCrypto={selectedCrypto} onCryptoSelect={setSelectedCrypto} />
+            </div>
+            <div className="lg:col-span-1">
+              <RiskReturnAnalyzer selectedCrypto={selectedCrypto} />
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+// --- RENDER APPLICATION --- //
+const rootElement = document.getElementById('root');
+if (!rootElement) {
+  throw new Error("Não foi possível encontrar o elemento root para montar a aplicação");
+}
+
+const root = ReactDOM.createRoot(rootElement);
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
